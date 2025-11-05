@@ -1,0 +1,195 @@
+import os
+import copy
+import random
+from collections import defaultdict
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
+from google.colab import drive
+
+# ----------------------------
+# Reproducibility
+# ----------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Mount Drive
+drive.mount('/content/drive', force_remount=True)
+save_dir = "/content/drive/My Drive/sim"
+os.makedirs(save_dir, exist_ok=True)
+
+# ----------------------------
+# L2FPPO Model for CIFAR-10 (flattened input)
+# ----------------------------
+class L2FPPO(nn.Module):
+    def __init__(self, input_dim, hidden_dim, action_dim):
+        super(L2FPPO, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, action_dim)
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=0, nonlinearity='relu')
+                nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        return self.fc2(x)  # logits for CrossEntropyLoss
+
+# ----------------------------
+# Load CIFAR-10 dataset
+# ----------------------------
+transform = transforms.Compose([
+    transforms.ToTensor(),
+])
+
+train_dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
+test_dataset = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
+
+input_dim = 3 * 32 * 32  # CIFAR-10 images flattened
+num_classes = 10
+
+# ----------------------------
+# Partition dataset among clients (Dirichlet non-IID)
+# ----------------------------
+def partition_cifar_dirichlet(dataset, num_clients=10, alpha=0.5):
+    targets = np.array(dataset.targets)
+    n_samples = len(targets)
+    client_indices = [[] for _ in range(num_clients)]
+    for cls in np.unique(targets):
+        cls_idx = np.where(targets == cls)[0]
+        np.random.shuffle(cls_idx)
+        proportions = np.random.dirichlet(alpha=[alpha]*num_clients)
+        proportions = np.clip(proportions, 1e-6, None)
+        proportions = proportions / proportions.sum()
+        counts = (proportions * len(cls_idx)).astype(int)
+        # adjust rounding
+        while counts.sum() < len(cls_idx):
+            counts[np.argmax(proportions)] += 1
+        start = 0
+        for c, cnt in enumerate(counts):
+            if cnt > 0:
+                client_indices[c].extend(cls_idx[start:start+cnt].tolist())
+                start += cnt
+    partitions = [Subset(dataset, idxs) for idxs in client_indices]
+    return partitions
+
+# ----------------------------
+# Local training function
+# ----------------------------
+def local_train_classification(model, optimizer, dataloader, local_epochs=1, device='cpu'):
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+    losses = []
+    for epoch in range(local_epochs):
+        for xb, yb in dataloader:
+            xb = xb.view(xb.size(0), -1).to(device)  # flatten
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+    return float(np.mean(losses)) if losses else 0.0
+
+# ----------------------------
+# Douglas–Rachford aggregation
+# ----------------------------
+def douglas_rachford_update(local_weights, global_state, rho=0.5):
+    avg_state = copy.deepcopy(local_weights[0])
+    for k in avg_state.keys():
+        summed = local_weights[0][k].clone().float()
+        for w in local_weights[1:]:
+            summed += w[k].float()
+        avg_state[k] = (summed / len(local_weights)).to(global_state[k].dtype)
+
+    new_state = copy.deepcopy(global_state)
+    for k in new_state.keys():
+        reflection = 2.0 * avg_state[k].to(global_state[k].device) - global_state[k]
+        new_state[k] = global_state[k] + rho * (reflection - avg_state[k].to(global_state[k].device))
+    return new_state
+
+# ----------------------------
+# Evaluate global model
+# ----------------------------
+def evaluate_model(model, dataloader, device='cpu'):
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    total_loss, correct, total = 0.0, 0, 0
+    with torch.no_grad():
+        for xb, yb in dataloader:
+            xb = xb.view(xb.size(0), -1).to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            total_loss += loss.item() * xb.size(0)
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == yb).sum().item()
+            total += xb.size(0)
+    return total_loss / total, correct / total
+
+# ----------------------------
+# Federated training loop
+# ----------------------------
+def federated_learning_cifar10(
+    lr, num_clients=10, rounds=50, local_epochs=1, rho=0.5, batch_size=32, device='cpu'
+):
+    partitions = partition_cifar_dirichlet(train_dataset, num_clients=num_clients, alpha=0.5)
+    client_models = [L2FPPO(input_dim, 512, num_classes).to(device) for _ in range(num_clients)]
+    client_optims = [optim.Adam(m.parameters(), lr=lr) for m in client_models]
+
+    global_state = copy.deepcopy(client_models[0].state_dict())
+
+    val_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+
+    val_losses, val_accs = [], []
+
+    for r in range(rounds):
+        local_weights = []
+
+        for c in range(num_clients):
+            client_models[c].load_state_dict(global_state)
+            dataloader = DataLoader(partitions[c], batch_size=batch_size, shuffle=True)
+            _ = local_train_classification(client_models[c], client_optims[c], dataloader,
+                                           local_epochs=local_epochs, device=device)
+            local_weights.append(copy.deepcopy(client_models[c].state_dict()))
+
+        # DR aggregation
+        global_state = douglas_rachford_update(local_weights, global_state, rho=rho)
+
+        # Evaluate
+        tmp_model = L2FPPO(input_dim, 512, num_classes).to(device)
+        tmp_model.load_state_dict(global_state)
+        val_loss, val_acc = evaluate_model(tmp_model, val_loader, device=device)
+        val_losses.append(val_loss)
+        val_accs.append(val_acc)
+
+        if (r+1) % max(1, rounds//5) == 0 or r < 3:
+            print(f"Round {r+1}/{rounds}  |  val_loss={val_loss:.4f}  val_acc={val_acc:.4f}")
+
+    return val_losses, val_accs
+
+# ----------------------------
+# Run multiple learning rates
+# ----------------------------
+learning_rates = [1e-2, 1e-3, 1e-4, 1e-5]
+rounds = 300  # reduce for Colab quick run
+results = {}
+
+for lr in learning_rates:
+    print(f"\n=== Running lr={lr} ===")
+    val_loss, val_acc = federated_learning_cifar10(
+        lr=lr, num_clients=1, rounds=rounds, local_epochs=1, rho=0.06, batch_size=64, device=device
+    )
+    results[lr] = {"loss": val_loss, "acc": val_acc}
