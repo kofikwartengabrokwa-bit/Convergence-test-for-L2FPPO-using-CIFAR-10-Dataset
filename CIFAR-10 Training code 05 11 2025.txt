@@ -21,10 +21,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Mount Drive
-drive.mount('/content/drive', force_remount=True)
-save_dir = "/content/drive/My Drive/sim"
-os.makedirs(save_dir, exist_ok=True)
+
 
 # ----------------------------
 # L2FPPO Model for CIFAR-10 (flattened input)
@@ -192,4 +189,5 @@ for lr in learning_rates:
     val_loss, val_acc = federated_learning_cifar10(
         lr=lr, num_clients=1, rounds=rounds, local_epochs=1, rho=0.06, batch_size=64, device=device
     )
+
     results[lr] = {"loss": val_loss, "acc": val_acc}
